@@ -22,6 +22,7 @@ struct HyperCube {
     Interleave interleave;
     GDALDataType data_type;
     std::vector<float> data;
+    std::vector<float> wavelengths;
 
     size_t pixel_count() const { return static_cast<size_t>(width) * height; }
     size_t total_elements() const { return static_cast<size_t>(width) * height * bands; }
@@ -48,6 +49,7 @@ public:
 
     const std::vector<double>& band_scales() const { return scale_; }
     const std::vector<double>& band_offsets() const { return offset_; }
+    const std::vector<float>& wavelengths() const { return wavelengths_; }
 
 private:
     void read_row_block_bip(int start_row, int num_rows, float* dst);
@@ -63,7 +65,9 @@ private:
     GDALDataType data_type_{GDT_Float32};
     std::vector<double> scale_;
     std::vector<double> offset_;
+    std::vector<float> wavelengths_;
     std::vector<float> line_buf_;
+    void parse_wavelengths();
 };
 
 class EnviReader {

@@ -80,6 +80,7 @@ set(SOURCES
     src/tensorrt_engine.cpp
     src/hyperspectral_engine.cpp
     src/mask_writer.cpp
+    src/spectral_filter.cpp
 )
 
 set(HEADERS
@@ -87,6 +88,7 @@ set(HEADERS
     include/tensorrt_engine.h
     include/hyperspectral_engine.h
     include/mask_writer.h
+    include/spectral_filter.h
 )
 
 add_executable(hs_infer ${SOURCES} ${HEADERS})

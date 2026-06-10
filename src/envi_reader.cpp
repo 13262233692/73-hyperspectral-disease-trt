@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 
 namespace hs {
 
@@ -69,6 +70,8 @@ bool EnviStreamReader::open(const std::string& hdr_path) {
 
     line_buf_.resize(width_ * bands_);
 
+    parse_wavelengths();
+
     return true;
 }
 
@@ -81,6 +84,7 @@ void EnviStreamReader::close() {
     data_type_ = GDT_Float32;
     scale_.clear();
     offset_.clear();
+    wavelengths_.clear();
     line_buf_.clear();
 }
 
@@ -220,6 +224,7 @@ std::unique_ptr<HyperCube> EnviReader::load(const std::string& hdr_path) {
     cube->interleave = reader.interleave();
     cube->data_type = reader.data_type();
     cube->data.resize(cube->total_elements());
+    cube->wavelengths = reader.wavelengths();
 
     const int rows_per_batch = 64;
     int pixels_read = 0;
@@ -230,6 +235,42 @@ std::unique_ptr<HyperCube> EnviReader::load(const std::string& hdr_path) {
     }
 
     return cube;
+}
+
+void EnviStreamReader::parse_wavelengths() {
+    wavelengths_.clear();
+    if (!dataset_) return;
+
+    const char* wl_str = dataset_->GetMetadataItem("wavelength", "ENVI");
+    if (!wl_str) {
+        for (int b = 0; b < bands_; ++b) {
+            GDALRasterBand* band = dataset_->GetRasterBand(b + 1);
+            const char* bwl = band->GetMetadataItem("wavelength");
+            if (bwl) {
+                wavelengths_.push_back(std::stof(bwl));
+            } else {
+                wavelengths_.clear();
+                break;
+            }
+        }
+        if (!wavelengths_.empty()) return;
+        return;
+    }
+
+    std::string wls(wl_str);
+    std::replace(wls.begin(), wls.end(), '{', ' ');
+    std::replace(wls.begin(), wls.end(), '}', ' ');
+    std::replace(wls.begin(), wls.end(), ',', ' ');
+
+    std::istringstream iss(wls);
+    float val;
+    while (iss >> val) {
+        wavelengths_.push_back(val);
+    }
+
+    if (static_cast<int>(wavelengths_.size()) != bands_) {
+        wavelengths_.clear();
+    }
 }
 
 } // namespace hs

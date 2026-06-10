@@ -7,6 +7,7 @@
 #include <chrono>
 #include "envi_reader.h"
 #include "tensorrt_engine.h"
+#include "spectral_filter.h"
 
 namespace hs {
 
@@ -18,7 +19,12 @@ struct InferenceResult {
     double load_time_ms;
     double preprocess_time_ms;
     double inference_time_ms;
+    double filter_time_ms;
     double total_time_ms;
+    int total_pixels;
+    int vegetation_pixels;
+    int filtered_pixels;
+    float vegetation_ratio;
 
     int8_t get_class(int x, int y) const {
         if (x < 0 || x >= width || y < 0 || y >= height) return -1;
@@ -44,6 +50,8 @@ public:
         int rows_per_tile = 128;
         SpectralNormalization normalization;
         bool use_streaming = true;
+        bool enable_spectral_filter = true;
+        SpectralFilterConfig filter_config;
     };
 
     explicit HyperspectralInferenceEngine(const Config& config);
@@ -72,6 +80,7 @@ private:
     Config config_;
     std::unique_ptr<EnviReader> reader_;
     std::unique_ptr<TensorRTEngine> trt_engine_;
+    std::unique_ptr<SpectralFilter> spectral_filter_;
 
     std::vector<float> norm_mean_;
     std::vector<float> norm_std_;
