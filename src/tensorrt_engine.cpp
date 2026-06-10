@@ -36,36 +36,70 @@ static void delete_trt_runtime(nvinfer1::IRuntime* p) { if (p) p->destroy(); }
 static void delete_trt_engine(nvinfer1::ICudaEngine* p) { if (p) p->destroy(); }
 static void delete_trt_context(nvinfer1::IExecutionContext* p) { if (p) p->destroy(); }
 
+__global__ void argmax_kernel(const float* logits, int8_t* output, int batch_size, int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        const float* row = logits + static_cast<size_t>(idx) * num_classes;
+        float max_val = row[0];
+        int8_t max_idx = 0;
+        for (int c = 1; c < num_classes; ++c) {
+            if (row[c] > max_val) {
+                max_val = row[c];
+                max_idx = static_cast<int8_t>(c);
+            }
+        }
+        output[idx] = max_idx;
+    }
+}
+
 TensorRTEngine::TensorRTEngine(const TensorRTConfig& config)
     : config_(config)
     , runtime_(nullptr, delete_trt_runtime)
     , engine_(nullptr, delete_trt_engine)
-    , context_(nullptr, delete_trt_context)
 {
-    if (config_.batch_size <= 0) {
-        config_.batch_size = 1024;
-    }
+    if (config_.batch_size <= 0) config_.batch_size = 4096;
+    if (config_.num_streams <= 0) config_.num_streams = 2;
+    if (config_.num_streams > 8) config_.num_streams = 8;
+
     set_device();
     load_engine();
     create_context();
-    allocate_buffers();
-    CUDA_CHECK(cudaStreamCreate(&stream_));
+    allocate_pinned_buffers();
 }
 
 TensorRTEngine::~TensorRTEngine() {
-    if (stream_) {
-        cudaStreamDestroy(stream_);
-        stream_ = nullptr;
+    for (auto& buf : buffers_) {
+        if (buf.stream) {
+            cudaStreamDestroy(buf.stream);
+            buf.stream = nullptr;
+        }
+        if (buf.ready_event) {
+            cudaEventDestroy(buf.ready_event);
+            buf.ready_event = nullptr;
+        }
+        if (buf.h_input) {
+            cudaFreeHost(buf.h_input);
+            buf.h_input = nullptr;
+        }
+        if (buf.h_output_labels) {
+            cudaFreeHost(buf.h_output_labels);
+            buf.h_output_labels = nullptr;
+        }
+        if (buf.d_input) {
+            cudaFree(buf.d_input);
+            buf.d_input = nullptr;
+        }
+        if (buf.d_output_logits) {
+            cudaFree(buf.d_output_logits);
+            buf.d_output_logits = nullptr;
+        }
+        if (buf.d_output_labels) {
+            cudaFree(buf.d_output_labels);
+            buf.d_output_labels = nullptr;
+        }
     }
-    if (d_input_) {
-        cudaFree(d_input_);
-        d_input_ = nullptr;
-    }
-    if (d_output_) {
-        cudaFree(d_output_);
-        d_output_ = nullptr;
-    }
-    context_.reset();
+    buffers_.clear();
+    contexts_.clear();
     engine_.reset();
     runtime_.reset();
 }
@@ -119,96 +153,177 @@ void TensorRTEngine::load_engine() {
 }
 
 void TensorRTEngine::create_context() {
-    context_.reset(engine_->createExecutionContext());
-    if (!context_) {
-        throw std::runtime_error("Failed to create execution context");
-    }
-    nvinfer1::Dims input_dims = engine_->getBindingDimensions(input_index_);
-    input_dims.d[0] = config_.batch_size;
-    context_->setBindingDimensions(input_index_, input_dims);
-}
-
-void TensorRTEngine::allocate_buffers() {
-    nvinfer1::Dims input_dims = context_->getBindingDimensions(input_index_);
-    nvinfer1::Dims output_dims = context_->getBindingDimensions(output_index_);
-
-    input_size_bytes_ = config_.batch_size * config_.input_channels * sizeof(float);
-    output_size_bytes_ = config_.batch_size * config_.num_classes * sizeof(float);
-
-    CUDA_CHECK(cudaMalloc(&d_input_, input_size_bytes_));
-    CUDA_CHECK(cudaMalloc(&d_output_, output_size_bytes_));
-}
-
-__global__ void argmax_kernel(const float* logits, int8_t* output, int batch_size, int num_classes) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < batch_size) {
-        const float* row = logits + idx * num_classes;
-        float max_val = row[0];
-        int8_t max_idx = 0;
-        for (int c = 1; c < num_classes; ++c) {
-            if (row[c] > max_val) {
-                max_val = row[c];
-                max_idx = static_cast<int8_t>(c);
-            }
+    contexts_.clear();
+    for (int s = 0; s < config_.num_streams; ++s) {
+        nvinfer1::IExecutionContext* ctx = engine_->createExecutionContext();
+        if (!ctx) {
+            throw std::runtime_error("Failed to create execution context " + std::to_string(s));
         }
-        output[idx] = max_idx;
+        nvinfer1::Dims input_dims = engine_->getBindingDimensions(input_index_);
+        input_dims.d[0] = config_.batch_size;
+        ctx->setBindingDimensions(input_index_, input_dims);
+        contexts_.emplace_back(ctx, delete_trt_context);
     }
 }
 
-void TensorRTEngine::infer_batch(const float* input, int8_t* output, int num_pixels) {
+void TensorRTEngine::allocate_pinned_buffers() {
+    buffers_.resize(config_.num_streams);
+
+    const size_t input_bytes = static_cast<size_t>(config_.batch_size) * config_.input_channels * sizeof(float);
+    const size_t output_logits_bytes = static_cast<size_t>(config_.batch_size) * config_.num_classes * sizeof(float);
+    const size_t output_labels_bytes = static_cast<size_t>(config_.batch_size) * sizeof(int8_t);
+
+    for (int s = 0; s < config_.num_streams; ++s) {
+        auto& buf = buffers_[s];
+        buf.input_bytes = input_bytes;
+        buf.output_logits_bytes = output_logits_bytes;
+        buf.output_labels_bytes = output_labels_bytes;
+        buf.in_flight = false;
+        buf.current_batch = 0;
+
+        CUDA_CHECK(cudaHostAlloc(&buf.h_input, input_bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&buf.h_output_labels, output_labels_bytes, cudaHostAllocDefault));
+
+        CUDA_CHECK(cudaMalloc(&buf.d_input, input_bytes));
+        CUDA_CHECK(cudaMalloc(&buf.d_output_logits, output_logits_bytes));
+        CUDA_CHECK(cudaMalloc(&buf.d_output_labels, output_labels_bytes));
+
+        CUDA_CHECK(cudaStreamCreateWithFlags(&buf.stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&buf.ready_event, cudaEventBlockingSync));
+    }
+}
+
+float* TensorRTEngine::acquire_pinned_input(int stream_idx) {
+    if (stream_idx < 0 || stream_idx >= config_.num_streams) return nullptr;
+    return buffers_[stream_idx].h_input;
+}
+
+int8_t* TensorRTEngine::acquire_pinned_output(int stream_idx) {
+    if (stream_idx < 0 || stream_idx >= config_.num_streams) return nullptr;
+    return buffers_[stream_idx].h_output_labels;
+}
+
+size_t TensorRTEngine::pinned_input_bytes(int stream_idx) const {
+    if (stream_idx < 0 || stream_idx >= config_.num_streams) return 0;
+    return buffers_[stream_idx].input_bytes;
+}
+
+size_t TensorRTEngine::pinned_output_bytes(int stream_idx) const {
+    if (stream_idx < 0 || stream_idx >= config_.num_streams) return 0;
+    return buffers_[stream_idx].output_labels_bytes;
+}
+
+void TensorRTEngine::launch_argmax(int stream_idx, int batch_size) {
+    auto& buf = buffers_[stream_idx];
+    const int block_size = 256;
+    const int grid_size = (batch_size + block_size - 1) / block_size;
+    argmax_kernel<<<grid_size, block_size, 0, buf.stream>>>(
+        buf.d_output_logits, buf.d_output_labels, batch_size, config_.num_classes);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void TensorRTEngine::submit_batch_async(int stream_idx, int batch_size) {
+    if (stream_idx < 0 || stream_idx >= config_.num_streams) return;
+    if (batch_size <= 0) return;
+
+    auto& buf = buffers_[stream_idx];
+    auto& ctx = contexts_[stream_idx];
+    buf.current_batch = batch_size;
+
+    const size_t input_bytes = static_cast<size_t>(batch_size) * config_.input_channels * sizeof(float);
+    const size_t output_labels_bytes = static_cast<size_t>(batch_size) * sizeof(int8_t);
+
+    CUDA_CHECK(cudaMemcpyAsync(buf.d_input, buf.h_input, input_bytes,
+        cudaMemcpyHostToDevice, buf.stream));
+
+    void* bindings[2];
+    bindings[input_index_] = buf.d_input;
+    bindings[output_index_] = buf.d_output_logits;
+
+    if (batch_size < config_.batch_size) {
+        nvinfer1::Dims input_dims = engine_->getBindingDimensions(input_index_);
+        input_dims.d[0] = batch_size;
+        ctx->setBindingDimensions(input_index_, input_dims);
+    }
+
+    if (!ctx->enqueueV2(bindings, buf.stream, nullptr)) {
+        throw std::runtime_error("TensorRT enqueueV2 failed on stream " + std::to_string(stream_idx));
+    }
+
+    launch_argmax(stream_idx, batch_size);
+
+    CUDA_CHECK(cudaMemcpyAsync(buf.h_output_labels, buf.d_output_labels, output_labels_bytes,
+        cudaMemcpyDeviceToHost, buf.stream));
+
+    CUDA_CHECK(cudaEventRecord(buf.ready_event, buf.stream));
+    buf.in_flight = true;
+
+    if (batch_size < config_.batch_size) {
+        nvinfer1::Dims input_dims = engine_->getBindingDimensions(input_index_);
+        input_dims.d[0] = config_.batch_size;
+        ctx->setBindingDimensions(input_index_, input_dims);
+    }
+}
+
+void TensorRTEngine::synchronize_stream(int stream_idx) {
+    if (stream_idx < 0 || stream_idx >= config_.num_streams) return;
+    auto& buf = buffers_[stream_idx];
+    if (!buf.in_flight) return;
+    CUDA_CHECK(cudaEventSynchronize(buf.ready_event));
+    buf.in_flight = false;
+}
+
+void TensorRTEngine::synchronize_all() {
+    for (int s = 0; s < config_.num_streams; ++s) {
+        synchronize_stream(s);
+    }
+}
+
+void TensorRTEngine::infer_full(const float* input, int8_t* output, int num_pixels) {
     if (!input || !output || num_pixels <= 0) return;
 
     const int batch = config_.batch_size;
     const int channels = config_.input_channels;
-    const int classes = config_.num_classes;
+    const int num_streams = config_.num_streams;
 
-    std::vector<float> h_output_logits(batch * classes);
+    int submitted = 0;
+    int completed = 0;
+    int stream_ptr = 0;
 
-    for (int pixel_base = 0; pixel_base < num_pixels; pixel_base += batch) {
-        int current_batch = std::min(batch, num_pixels - pixel_base);
-        size_t input_bytes = current_batch * channels * sizeof(float);
-
-        CUDA_CHECK(cudaMemcpyAsync(d_input_, input + pixel_base * channels,
-            input_bytes, cudaMemcpyHostToDevice, stream_));
-
-        void* bindings[2];
-        bindings[input_index_] = d_input_;
-        bindings[output_index_] = d_output_;
-
-        if (current_batch < batch) {
-            nvinfer1::Dims input_dims = engine_->getBindingDimensions(input_index_);
-            input_dims.d[0] = current_batch;
-            context_->setBindingDimensions(input_index_, input_dims);
-        }
-
-        if (!context_->enqueueV2(bindings, stream_, nullptr)) {
-            throw std::runtime_error("TensorRT enqueueV2 failed");
-        }
-
-        size_t output_bytes = current_batch * classes * sizeof(float);
-        CUDA_CHECK(cudaMemcpyAsync(h_output_logits.data(), d_output_,
-            output_bytes, cudaMemcpyDeviceToHost, stream_));
-
-        CUDA_CHECK(cudaStreamSynchronize(stream_));
-
-        for (int i = 0; i < current_batch; ++i) {
-            const float* row = h_output_logits.data() + i * classes;
-            float max_val = row[0];
-            int8_t max_idx = 0;
-            for (int c = 1; c < classes; ++c) {
-                if (row[c] > max_val) {
-                    max_val = row[c];
-                    max_idx = static_cast<int8_t>(c);
-                }
+    while (completed < num_pixels) {
+        while (submitted < num_pixels) {
+            if (buffers_[stream_ptr].in_flight) {
+                break;
             }
-            output[pixel_base + i] = max_idx;
+
+            int cur = std::min(batch, num_pixels - submitted);
+            auto& buf = buffers_[stream_ptr];
+
+            std::memcpy(buf.h_input, input + static_cast<size_t>(submitted) * channels,
+                static_cast<size_t>(cur) * channels * sizeof(float));
+
+            submit_batch_async(stream_ptr, cur);
+            submitted += cur;
+            stream_ptr = (stream_ptr + 1) % num_streams;
         }
 
-        if (current_batch < batch) {
-            nvinfer1::Dims input_dims = engine_->getBindingDimensions(input_index_);
-            input_dims.d[0] = batch;
-            context_->setBindingDimensions(input_index_, input_dims);
+        int oldest = -1;
+        for (int s = 0; s < num_streams; ++s) {
+            if (buffers_[s].in_flight) {
+                oldest = s;
+                break;
+            }
         }
+        if (oldest < 0 && submitted >= num_pixels) break;
+        if (oldest < 0) continue;
+
+        synchronize_stream(oldest);
+
+        auto& buf = buffers_[oldest];
+        int actual = buf.current_batch;
+        std::memcpy(output + static_cast<size_t>(completed), buf.h_output_labels,
+            static_cast<size_t>(actual) * sizeof(int8_t));
+        completed += actual;
     }
 }
 

@@ -38,9 +38,12 @@ public:
         std::string engine_path;
         int input_channels;
         int num_classes;
-        int batch_size = 2048;
+        int batch_size = 4096;
         int device_id = 0;
+        int num_streams = 2;
+        int rows_per_tile = 128;
         SpectralNormalization normalization;
+        bool use_streaming = true;
     };
 
     explicit HyperspectralInferenceEngine(const Config& config);
@@ -53,12 +56,26 @@ public:
 
     std::unique_ptr<InferenceResult> run(const HyperCube& cube);
 
+    std::unique_ptr<InferenceResult> run_streaming(const std::string& hdr_path);
+
 private:
-    void preprocess_normalize(float* data, size_t pixel_count);
+    void preprocess_normalize(float* data, size_t pixel_count,
+                              const std::vector<double>& band_scales,
+                              const std::vector<double>& band_offsets);
+
+    void compute_running_stats(const float* data, size_t pixel_count,
+                               std::vector<double>& sum, std::vector<double>& sum_sq);
+
+    void apply_normalization(float* data, size_t pixel_count,
+                             const std::vector<double>& mean, const std::vector<double>& stdv);
 
     Config config_;
     std::unique_ptr<EnviReader> reader_;
     std::unique_ptr<TensorRTEngine> trt_engine_;
+
+    std::vector<float> norm_mean_;
+    std::vector<float> norm_std_;
+    bool norm_stats_ready_{false};
 };
 
 } // namespace hs

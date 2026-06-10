@@ -14,9 +14,12 @@ static void print_usage(const char* prog) {
         << "  --output <path>       Output mask PNG file path (optional)\n"
         << "  --channels <int>      Number of spectral channels (default: 200)\n"
         << "  --classes <int>       Number of classification classes (default: 3)\n"
-        << "  --batch <int>         Inference batch size (default: 2048)\n"
+        << "  --batch <int>         Inference batch size per stream (default: 4096)\n"
+        << "  --streams <int>       Number of CUDA streams for overlap (default: 2)\n"
+        << "  --rows-per-tile <int> Rows per streaming tile (default: 128)\n"
         << "  --device <int>        CUDA device ID (default: 0)\n"
         << "  --no-normalize        Disable spectral normalization\n"
+        << "  --no-streaming        Disable streaming mode (load full cube)\n"
         << std::endl;
 }
 
@@ -26,9 +29,12 @@ int main(int argc, char* argv[]) {
     std::string output_path;
     int channels = 200;
     int classes = 3;
-    int batch = 2048;
+    int batch = 4096;
+    int streams = 2;
+    int rows_per_tile = 128;
     int device = 0;
     bool normalize = true;
+    bool use_streaming = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -44,10 +50,16 @@ int main(int argc, char* argv[]) {
             classes = std::atoi(argv[++i]);
         } else if (arg == "--batch" && i + 1 < argc) {
             batch = std::atoi(argv[++i]);
+        } else if (arg == "--streams" && i + 1 < argc) {
+            streams = std::atoi(argv[++i]);
+        } else if (arg == "--rows-per-tile" && i + 1 < argc) {
+            rows_per_tile = std::atoi(argv[++i]);
         } else if (arg == "--device" && i + 1 < argc) {
             device = std::atoi(argv[++i]);
         } else if (arg == "--no-normalize") {
             normalize = false;
+        } else if (arg == "--no-streaming") {
+            use_streaming = false;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
@@ -65,50 +77,66 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        std::cout << "==================================================" << std::endl;
+        std::cout << "======================================================" << std::endl;
         std::cout << "  Hyperspectral Disease Classification Engine" << std::endl;
-        std::cout << "  Target: Jetson Orin (CUDA + TensorRT)" << std::endl;
-        std::cout << "==================================================" << std::endl;
-        std::cout << "  Engine:   " << engine_path << std::endl;
-        std::cout << "  HDR:      " << hdr_path << std::endl;
-        std::cout << "  Channels: " << channels << std::endl;
-        std::cout << "  Classes:  " << classes << std::endl;
-        std::cout << "  Batch:    " << batch << std::endl;
-        std::cout << "  Device:   " << device << std::endl;
-        std::cout << "  Normalize:" << (normalize ? " yes" : " no") << std::endl;
-        std::cout << "==================================================" << std::endl;
+        std::cout << "  Target: Jetson Orin (CUDA + TensorRT + Pinned Memory)" << std::endl;
+        std::cout << "======================================================" << std::endl;
+        std::cout << "  Engine:        " << engine_path << std::endl;
+        std::cout << "  HDR:           " << hdr_path << std::endl;
+        std::cout << "  Channels:      " << channels << std::endl;
+        std::cout << "  Classes:       " << classes << std::endl;
+        std::cout << "  Batch/stream:  " << batch << " pixels" << std::endl;
+        std::cout << "  CUDA streams:  " << streams << " (pinned + overlap)" << std::endl;
+        std::cout << "  Rows/tile:     " << rows_per_tile << std::endl;
+        std::cout << "  Device:        " << device << std::endl;
+        std::cout << "  Normalize:     " << (normalize ? "yes" : "no") << std::endl;
+        std::cout << "  Streaming:     " << (use_streaming ? "yes (tile-based)" : "no (full load)") << std::endl;
+        std::cout << "======================================================" << std::endl;
 
         hs::HyperspectralInferenceEngine::Config cfg;
         cfg.engine_path = engine_path;
         cfg.input_channels = channels;
         cfg.num_classes = classes;
         cfg.batch_size = batch;
+        cfg.num_streams = streams;
+        cfg.rows_per_tile = rows_per_tile;
         cfg.device_id = device;
         cfg.normalization.enable = normalize;
+        cfg.use_streaming = use_streaming;
 
-        std::cout << "\n[1/3] Initializing TensorRT engine..." << std::endl;
+        std::cout << "\n[1/4] Initializing TensorRT engine + Pinned Memory..." << std::endl;
         hs::HyperspectralInferenceEngine engine(cfg);
-        std::cout << "      Engine initialized successfully" << std::endl;
 
-        std::cout << "\n[2/3] Loading ENVI hypercube & running inference..." << std::endl;
+        {
+            size_t input_mb_per_stream = static_cast<size_t>(batch) * channels * sizeof(float) / (1024 * 1024);
+            size_t output_kb_per_stream = static_cast<size_t>(batch) * sizeof(int8_t);
+            size_t total_host_mb = (input_mb_per_stream + (output_kb_per_stream / (1024 * 1024))) * streams;
+            std::cout << "      Pinned host memory: ~" << total_host_mb
+                      << " MB (" << streams << " streams)" << std::endl;
+            std::cout << "      Engine initialized successfully" << std::endl;
+        }
+
+        std::cout << "\n[2/4] Streaming ENVI hypercube through Pinned pipeline..." << std::endl;
         auto result = engine.run(hdr_path);
 
-        std::cout << "\n[3/3] Inference complete!" << std::endl;
-        std::cout << "--------------------------------------------------" << std::endl;
-        std::cout << "  Hypercube: " << result->width << " x " << result->height
+        std::cout << "\n[3/4] Inference pipeline complete!" << std::endl;
+        std::cout << "------------------------------------------------------" << std::endl;
+        std::cout << "  Hypercube:  " << result->width << " x " << result->height
                   << " x " << channels << " bands" << std::endl;
-        std::cout << "  Pixels:    " << result->width * result->height << std::endl;
+        std::cout << "  Pixels:     " << result->width * result->height << std::endl;
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "  Load:      " << result->load_time_ms << " ms" << std::endl;
-        std::cout << "  Preproc:   " << result->preprocess_time_ms << " ms" << std::endl;
-        std::cout << "  Inference: " << result->inference_time_ms << " ms" << std::endl;
-        std::cout << "  Total:     " << result->total_time_ms << " ms" << std::endl;
+        std::cout << "  Load:       " << result->load_time_ms << " ms" << std::endl;
+        std::cout << "  Preproc:    " << result->preprocess_time_ms << " ms" << std::endl;
+        std::cout << "  Inference:  " << result->inference_time_ms << " ms" << std::endl;
+        std::cout << "  Total:      " << result->total_time_ms << " ms" << std::endl;
 
         if (result->width * result->height > 0) {
             double fps = 1000.0 / result->total_time_ms;
-            std::cout << "  FPS:       " << fps << std::endl;
+            double mpps = static_cast<double>(result->width * result->height) / result->total_time_ms / 1000.0;
+            std::cout << "  FPS:        " << fps << std::endl;
+            std::cout << "  Throughput: " << mpps << " Mpix/s" << std::endl;
         }
-        std::cout << "--------------------------------------------------" << std::endl;
+        std::cout << "------------------------------------------------------" << std::endl;
 
         std::vector<int> class_counts(classes, 0);
         for (auto c : result->class_mask) {
@@ -121,12 +149,14 @@ int main(int argc, char* argv[]) {
             const char* name = (c < 3) ? class_names[c] : ("Class_" + std::to_string(c)).c_str();
             double pct = total_pixels > 0 ? (100.0 * class_counts[c] / total_pixels) : 0.0;
             std::cout << "    [" << c << "] " << std::setw(14) << std::left
-                      << name << ": " << class_counts[c]
+                      << name << ": " << std::setw(8) << std::right << class_counts[c]
                       << " (" << std::setprecision(1) << pct << "%)" << std::endl;
         }
         std::cout << std::endl;
 
         if (!output_path.empty()) {
+            std::cout << "[4/4] Writing output masks..." << std::endl;
+
             std::string png_path = output_path;
             std::string tiff_path;
             auto pos = output_path.find_last_of('.');
@@ -143,17 +173,18 @@ int main(int argc, char* argv[]) {
                 result->class_mask.data(), classes);
 
             if (png_ok) {
-                std::cout << "  Color mask (PNG) saved: " << png_path << std::endl;
+                std::cout << "    Color mask (PNG):  " << png_path << std::endl;
             } else {
-                std::cerr << "  Failed to write PNG mask" << std::endl;
+                std::cerr << "    Failed to write PNG mask" << std::endl;
             }
             if (tiff_ok) {
-                std::cout << "  Class mask (TIFF) saved: " << tiff_path << std::endl;
+                std::cout << "    Class mask (TIFF): " << tiff_path << std::endl;
             } else {
-                std::cerr << "  Failed to write TIFF mask" << std::endl;
+                std::cerr << "    Failed to write TIFF mask" << std::endl;
             }
         }
 
+        std::cout << "\nAll done. Exiting." << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "\nERROR: " << e.what() << std::endl;
